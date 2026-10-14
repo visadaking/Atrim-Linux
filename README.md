@@ -1,4 +1,4 @@
-# atrim Launcher
+# Atrim for Linux
 This is a launcher for the atrim client, a custom client for Amnesia: The Dark Descent. The launcher is a simple, rudimentary qt6 application written in C++.
 
 **Keep in mind that you need a legal copy of Amnesia: The Dark Descent in order to use both the launcher and the client needed to play the game. Cracked copies may work but are neither tested nor supported.**
