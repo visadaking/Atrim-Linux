@@ -51,8 +51,3 @@ Optional:
 ```bash
 cmake -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build
-
-## License
-
-this launcher is licensed under GNU GPL v3. See `LICENSE` (LICENSE) (or LICENSE.md if that’s what the repo uses).Atrim client binaries and assets come from roozerxc/atrim under their terms.© 2009–2010 Frictional Games. Amnesia: The Dark Descent, Frictional, and the HPL Engine are trademarks of Frictional Games. All rights rese
-
