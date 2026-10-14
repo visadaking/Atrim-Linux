@@ -7,6 +7,9 @@
 #include <QFileDialog>
 #include <QFileInfo>
 #include <QInputDialog>
+#include <QJsonArray>
+#include <QJsonDocument>
+#include <QJsonObject>
 #include <QLabel>
 #include <QMessageBox>
 #include <QNetworkAccessManager>
@@ -73,18 +76,19 @@ public:
         browseButton = new QPushButton("Choose game folder…");
 
         versionBox = new QComboBox;
-        // Official install flow (roozerxc/atrim Releases): download the zip,
-        // drag ALL of its contents into the Amnesia folder, overwrite.
-        // Sizes + SHA-256 verified against the GitHub release API.
-        for (const ReleaseInfo &rel : releases())
-            versionBox->addItem(rel.label, releaseToData(rel));
 
         installButton = new QPushButton("Install selected Atrim version");
         installButton->setEnabled(false);
         installButton->setToolTip("Download and install the selected version into the game folder");
 
+        restoreButton = new QPushButton("Restore from backup…");
+        restoreButton->setToolTip("Restore files from a previous Atrim backup");
+
         auto *glButton = new QPushButton("Check OpenGL");
         glButton->setToolTip("Amnesia needs OpenGL 2.1 or newer");
+
+        cancelButton = new QPushButton("Cancel download");
+        cancelButton->setVisible(false);
 
         progressBar = new QProgressBar;
         progressBar->setRange(0, 0);
@@ -102,7 +106,9 @@ public:
         layout->addWidget(new QLabel("Atrim version:"));
         layout->addWidget(versionBox);
         layout->addWidget(installButton);
+        layout->addWidget(restoreButton);
         layout->addWidget(glButton);
+        layout->addWidget(cancelButton);
         layout->addWidget(progressBar);
         layout->addWidget(statusLabel);
         layout->addStretch(1);
@@ -116,14 +122,24 @@ public:
         connect(installButton, &QPushButton::clicked,
                 this, [this] { installSelected(); });
 
+        connect(restoreButton, &QPushButton::clicked,
+                this, [this] { restoreBackup(); });
+
         connect(glButton, &QPushButton::clicked,
                 this, [this] { checkOpenGL(); });
+
+        connect(cancelButton, &QPushButton::clicked, this, [this] {
+            if (activeReply)
+                activeReply->abort();
+        });
 
         // Restore last folder if it is still valid.
         QSettings settings("Atrim", "AtrimLinux");
         const QString last = settings.value("lastFolder").toString();
         if (!last.isEmpty() && isAmnesiaInstall(last))
             selectFolder(last);
+
+        populateVersions();
     }
 
 private:
@@ -133,15 +149,24 @@ private:
     QPushButton *installButton = nullptr;
     QPushButton *scanButton = nullptr;
     QPushButton *browseButton = nullptr;
+    QPushButton *restoreButton = nullptr;
+    QPushButton *cancelButton = nullptr;
     QProgressBar *progressBar = nullptr;
+    QNetworkReply *activeReply = nullptr;
     QString selectedFolder;
+
+    struct ReleaseInfo {
+        QString label;
+        QString url;
+        qint64 size = 0;
+        QString sha256;
+    };
 
     static bool fileExistsInsensitive(const QDir &dir, const QString &name)
     {
         if (QFileInfo(dir.filePath(name)).isFile())
             return true;
 
-        // Linux filesystems are case-sensitive; retail/GOG copies vary.
         const QString lower = name.toLower();
         const QFileInfoList entries = dir.entryInfoList(QDir::Files | QDir::NoSymLinks);
         for (const QFileInfo &e : entries) {
@@ -166,7 +191,6 @@ private:
         const bool hasMaps = QDir(dir.filePath("maps")).exists()
             || QDir(dir.filePath("maps/main")).exists();
 
-        // resources.cfg alone is too generic (other HPL games/mods match).
         return hasCfg && (hasExe || hasMaps);
     }
 
@@ -192,6 +216,7 @@ private:
         scanButton->setEnabled(!busy);
         browseButton->setEnabled(!busy);
         installButton->setEnabled(!busy && !selectedFolder.isEmpty());
+        restoreButton->setEnabled(!busy);
         progressBar->setVisible(busy);
         if (!msg.isEmpty())
             statusLabel->setText(msg);
@@ -260,7 +285,6 @@ private:
         };
 
         QStringList libraries;
-        // Matches both legacy and current libraryfolders.vdf quoting.
         const QRegularExpression pathRe(
             R"rx("path"\s+"([^"]+)")rx",
             QRegularExpression::CaseInsensitiveOption
@@ -298,8 +322,6 @@ private:
         };
         roots << steamLibraries();
 
-        // Init-system independent: QStorageInfo reads /proc/self/mounts,
-        // works on systemd, OpenRC, runit and s6 alike.
         for (const QStorageInfo &volume : QStorageInfo::mountedVolumes()) {
             const QString mount = QDir::cleanPath(volume.rootPath());
             if (mount.startsWith("/mnt/")
@@ -310,7 +332,6 @@ private:
         }
 
         roots.removeDuplicates();
-        // Drop non-existent roots so walk() does not waste time.
         roots.erase(std::remove_if(roots.begin(), roots.end(),
             [](const QString &r) { return !QDir(r).exists(); }),
             roots.end());
@@ -320,6 +341,7 @@ private:
         int visitedCount = 0;
         constexpr int maxVisited = 20000;
         constexpr int maxDepth = 5;
+        bool hitLimit = false;
 
         std::function<void(const QString &, int)> walk =
             [&](const QString &path, int depth) {
@@ -364,20 +386,23 @@ private:
 
                     walk(child.absoluteFilePath(), depth - 1);
 
-                    if (visitedCount >= maxVisited)
+                    if (visitedCount >= maxVisited) {
+                        hitLimit = true;
                         return;
+                    }
                 }
             };
 
         for (const QString &root : roots) {
-            // external mounts: keep depth shallow to avoid full-disk walks.
             const bool isMount = root.startsWith("/mnt/")
                 || root.startsWith("/media/")
                 || root.startsWith("/run/media/");
             walk(root, isMount ? 4 : maxDepth);
 
-            if (visitedCount >= maxVisited)
+            if (visitedCount >= maxVisited) {
+                hitLimit = true;
                 break;
+            }
         }
 
         found.removeDuplicates();
@@ -387,13 +412,18 @@ private:
 
         if (found.isEmpty()) {
             statusLabel->setText(
-                "No installation found. Choose the game folder manually."
+                hitLimit
+                    ? "No installation found (scan limit reached). Choose the game folder manually."
+                    : "No installation found. Choose the game folder manually."
             );
             return;
         }
 
         if (found.size() == 1) {
             selectFolder(found.first());
+            if (hitLimit)
+                statusLabel->setText(statusLabel->text()
+                    + "\n(Scan limit reached; other installs may exist.)");
             return;
         }
 
@@ -436,8 +466,6 @@ private:
         return proc.exitStatus() == QProcess::NormalExit && proc.exitCode() == 0;
     }
 
-    // Qt-native download: no curl/wget dependency, so this works on minimal
-    // distros (Alpine/musl, Gentoo OpenRC, Void, NixOS) and inside AppImage.
     bool downloadFile(const QUrl &url, const QString &destPath, QString *errOut)
     {
         QFile out(destPath);
@@ -449,7 +477,7 @@ private:
 
         QNetworkAccessManager manager;
         QNetworkRequest request(url);
-        request.setHeader(QNetworkRequest::UserAgentHeader, "AtrimLinuxLauncher/0.2");
+        request.setHeader(QNetworkRequest::UserAgentHeader, "AtrimLinuxLauncher/0.3");
 #if QT_VERSION_MAJOR >= 6
         request.setAttribute(QNetworkRequest::RedirectPolicyAttribute,
                              QNetworkRequest::NoLessSafeRedirectPolicy);
@@ -463,14 +491,14 @@ private:
                 *errOut = "Network request failed to start.";
             return false;
         }
+        activeReply = reply;
+        cancelButton->setVisible(true);
 
         QEventLoop loop;
         QTimer timeout;
         timeout.setSingleShot(true);
-        timeout.setInterval(120000);
-        connect(&timeout, &QTimer::timeout, &loop, [&] {
-            reply->abort();
-        });
+        timeout.setInterval(180000);
+        connect(&timeout, &QTimer::timeout, &loop, [&] { reply->abort(); });
         connect(reply, &QNetworkReply::downloadProgress, this,
                 [&](qint64 received, qint64 total) {
             if (total > 0) {
@@ -490,31 +518,35 @@ private:
         loop.exec();
         timeout.stop();
 
+        activeReply = nullptr;
+        cancelButton->setVisible(false);
+
         const bool ok = (reply->error() == QNetworkReply::NoError);
         QString netErr;
         if (!ok)
             netErr = reply->errorString();
-        // Flush anything left in the buffer.
         out.write(reply->readAll());
         out.close();
         reply->deleteLater();
 
         if (!ok) {
             QFile::remove(destPath);
-            if (errOut)
-                *errOut = "Download failed: " + netErr;
+            if (errOut) {
+                if (netErr.contains(QStringLiteral("cancel"), Qt::CaseInsensitive)
+                    || netErr.contains(QStringLiteral("Operation canceled"), Qt::CaseInsensitive))
+                    *errOut = "Download canceled.";
+                else
+                    *errOut = "Download failed: " + netErr;
+            }
             return false;
         }
         return true;
     }
 
-    // Qt-native file copy: avoids GNU-only "cp -a" (missing/different on
-    // BusyBox, BSD, minimal containers). Overwrites destination.
     static bool copyFileOverwrite(const QString &src, const QString &dst, QString *errOut)
     {
         QFileInfo srcInfo(src);
         if (srcInfo.isSymLink()) {
-            // Preserve symlinks where possible; fall back to content copy.
             const QString target = srcInfo.symLinkTarget();
             QFile::remove(dst);
             if (QFile::link(target, dst))
@@ -556,8 +588,6 @@ private:
         return true;
     }
 
-    // Extraction with distro fallbacks: unzip (BusyBox/GNU), 7z/7zz/7za,
-    // bsdtar (libarchive), python3 zipfile (near-universal fallback).
     static bool extractArchive(const QString &archive, const QString &destDir, QString *errOut)
     {
         QStringList attempts;
@@ -570,7 +600,6 @@ private:
             }
             QString err;
             if (runBlocking(prog, args, &err)) {
-                // Sanity: extractor must have produced something.
                 QDir d(destDir);
                 if (!d.entryList(QDir::Files | QDir::Dirs | QDir::NoDotAndDotDot).isEmpty())
                     return true;
@@ -609,7 +638,6 @@ private:
 
     static QString backupBaseDir()
     {
-        // Respects $XDG_DATA_HOME on all distros; falls back to ~/.local/share.
         QString base = QStandardPaths::writableLocation(QStandardPaths::GenericDataLocation);
         if (base.isEmpty())
             base = QDir::homePath() + "/.local/share";
@@ -625,7 +653,6 @@ private:
         if (QFileInfo(nativeDoc).isDir())
             out << nativeDoc;
 
-        // Heroic Proton prefixes: <base>/*/pfx/drive_c/users/*/Documents/Amnesia
         const QStringList prefixBases = {
             home + "/Games/Heroic/Prefixes",
             home + "/.config/heroic/prefixes"
@@ -653,18 +680,10 @@ private:
         return out;
     }
 
-    struct ReleaseInfo {
-        QString label;
-        QString url;
-        qint64 size = 0;
-        QString sha256;
-    };
-
-    // Mirrors the official roozerxc/atrim Releases page: latest stable plus
-    // the newest beta archives. Sizes/SHA-256 taken from the GitHub API.
-    static const QList<ReleaseInfo> &releases()
+    // Pinned offline fallback (official roozerxc/atrim Releases).
+    static QList<ReleaseInfo> staticReleases()
     {
-        static const QList<ReleaseInfo> list = {
+        return {
             {"Stable — v1.4.5-win32-release",
              "https://github.com/roozerxc/atrim/releases/download/"
              "v1.4.5-win32/v1.4.5-win32-release.zip",
@@ -681,12 +700,122 @@ private:
              10001867,
              "6367efd32dd3fdb233bc62bb6e2e390da176c42aa532913a9760e34ea3440e34"},
         };
-        return list;
     }
 
     static QStringList releaseToData(const ReleaseInfo &rel)
     {
         return {rel.url, QString::number(rel.size), rel.sha256};
+    }
+
+    QList<ReleaseInfo> fetchReleasesFromApi()
+    {
+        QList<ReleaseInfo> out;
+
+        QNetworkAccessManager manager;
+        QNetworkRequest request(QUrl(
+            QStringLiteral("https://api.github.com/repos/roozerxc/atrim/releases?per_page=15")));
+        request.setHeader(QNetworkRequest::UserAgentHeader, "AtrimLinuxLauncher/0.3");
+        request.setRawHeader("Accept", "application/vnd.github+json");
+#if QT_VERSION_MAJOR >= 6
+        request.setAttribute(QNetworkRequest::RedirectPolicyAttribute,
+                             QNetworkRequest::NoLessSafeRedirectPolicy);
+#else
+        request.setAttribute(QNetworkRequest::FollowRedirectsAttribute, true);
+#endif
+
+        QNetworkReply *reply = manager.get(request);
+        if (!reply)
+            return out;
+
+        QEventLoop loop;
+        QTimer timeout;
+        timeout.setSingleShot(true);
+        timeout.setInterval(15000);
+        connect(&timeout, &QTimer::timeout, &loop, [&] { reply->abort(); });
+        connect(reply, &QNetworkReply::finished, &loop, &QEventLoop::quit);
+        timeout.start();
+        loop.exec();
+        timeout.stop();
+
+        if (reply->error() != QNetworkReply::NoError) {
+            reply->deleteLater();
+            return out;
+        }
+
+        const QJsonDocument doc = QJsonDocument::fromJson(reply->readAll());
+        reply->deleteLater();
+        if (!doc.isArray())
+            return out;
+
+        const QJsonArray releases = doc.array();
+        for (const QJsonValue &rv : releases) {
+            const QJsonObject ro = rv.toObject();
+            const QString tag = ro.value(QStringLiteral("tag_name")).toString();
+            const bool prerelease = ro.value(QStringLiteral("prerelease")).toBool();
+            const QJsonArray assets = ro.value(QStringLiteral("assets")).toArray();
+            for (const QJsonValue &av : assets) {
+                const QJsonObject ao = av.toObject();
+                const QString name = ao.value(QStringLiteral("name")).toString();
+                if (!name.endsWith(QStringLiteral(".zip"), Qt::CaseInsensitive))
+                    continue;
+                // Prefer known Atrim payload names; skip source archives.
+                if (name.contains(QStringLiteral("source"), Qt::CaseInsensitive))
+                    continue;
+
+                ReleaseInfo rel;
+                rel.url = ao.value(QStringLiteral("browser_download_url")).toString();
+                rel.size = static_cast<qint64>(ao.value(QStringLiteral("size")).toDouble());
+                // GitHub API does not publish SHA-256 of assets; leave empty
+                // unless we match a known static pin below.
+                rel.sha256.clear();
+                rel.label = (prerelease ? QStringLiteral("Beta — ") : QStringLiteral("Stable — "))
+                    + (tag.isEmpty() ? name : tag + " / " + name);
+
+                if (rel.url.isEmpty())
+                    continue;
+
+                // Overlay pinned SHA-256 when URL matches a static entry.
+                for (const ReleaseInfo &pin : staticReleases()) {
+                    if (pin.url == rel.url) {
+                        rel.sha256 = pin.sha256;
+                        if (rel.size <= 0)
+                            rel.size = pin.size;
+                        break;
+                    }
+                }
+                out << rel;
+            }
+        }
+        return out;
+    }
+
+    void populateVersions()
+    {
+        versionBox->clear();
+        statusLabel->setText("Fetching release list…");
+        QApplication::processEvents();
+
+        QList<ReleaseInfo> list = fetchReleasesFromApi();
+        QString sourceNote;
+        if (list.isEmpty()) {
+            list = staticReleases();
+            sourceNote = "Using offline release list (GitHub API unavailable).";
+        } else {
+            sourceNote = QString("Loaded %1 asset(s) from GitHub.").arg(list.size());
+        }
+
+        for (const ReleaseInfo &rel : list)
+            versionBox->addItem(rel.label, releaseToData(rel));
+
+        QSettings settings("Atrim", "AtrimLinux");
+        const QString lastVer = settings.value("lastVersion").toString();
+        if (!lastVer.isEmpty()) {
+            const int idx = versionBox->findText(lastVer);
+            if (idx >= 0)
+                versionBox->setCurrentIndex(idx);
+        }
+
+        statusLabel->setText(sourceNote);
     }
 
     ReleaseInfo currentRelease() const
@@ -715,6 +844,64 @@ private:
         while (!f.atEnd())
             hash.addData(f.read(1 << 20));
         return QString::fromLatin1(hash.result().toHex());
+    }
+
+    void restoreBackup()
+    {
+        const QString base = backupBaseDir();
+        QDir baseDir(base);
+        if (!baseDir.exists()) {
+            QMessageBox::information(this, "No backups",
+                "No backups found in:\n" + base);
+            return;
+        }
+
+        QStringList stamps = baseDir.entryList(
+            QDir::Dirs | QDir::NoDotAndDotDot, QDir::Name | QDir::Reversed);
+        if (stamps.isEmpty()) {
+            QMessageBox::information(this, "No backups",
+                "No backups found in:\n" + base);
+            return;
+        }
+
+        bool ok = false;
+        const QString stamp = QInputDialog::getItem(
+            this, "Restore backup", "Choose backup:", stamps, 0, false, &ok);
+        if (!ok || stamp.isEmpty())
+            return;
+
+        if (selectedFolder.isEmpty()) {
+            QMessageBox::warning(this, "No game folder",
+                "Select the Amnesia game folder first, then restore into it.");
+            return;
+        }
+
+        const QString backupPath = baseDir.filePath(stamp);
+        const auto confirm = QMessageBox::question(
+            this, "Confirm restore",
+            "Restore from:\n" + backupPath + "\n\nInto:\n" + selectedFolder
+            + "\n\nFiles with the same names will be overwritten.",
+            QMessageBox::Yes | QMessageBox::No, QMessageBox::No);
+        if (confirm != QMessageBox::Yes)
+            return;
+
+        setBusy(true, "Restoring backup…");
+        QString err;
+        QDir bak(backupPath);
+        const QFileInfoList entries = bak.entryInfoList(
+            QDir::Files | QDir::Dirs | QDir::NoDotAndDotDot);
+        for (const QFileInfo &e : entries) {
+            if (!copyRecursively(e.absoluteFilePath(),
+                                 selectedFolder + "/" + e.fileName(), &err)) {
+                setBusy(false);
+                QMessageBox::critical(this, "Restore failed", err);
+                return;
+            }
+        }
+        setBusy(false);
+        statusLabel->setText("Restore complete from:\n" + backupPath);
+        QMessageBox::information(this, "Restored",
+            "Backup restored into:\n" + selectedFolder);
     }
 
     void installSelected()
@@ -747,6 +934,21 @@ private:
             return;
         }
 
+        {
+            QStorageInfo storage(selectedFolder);
+            storage.refresh();
+            const qint64 need = qMax(rel.size, qint64(20) * 1024 * 1024) * 3;
+            if (storage.isValid() && storage.bytesAvailable() > 0
+                && storage.bytesAvailable() < need) {
+                QMessageBox::warning(
+                    this, "Not enough free space",
+                    QString("Need about %1 MiB free near the game folder.\nAvailable: %2 MiB.")
+                        .arg(need / 1048576)
+                        .arg(storage.bytesAvailable() / 1048576));
+                return;
+            }
+        }
+
         const auto answer = QMessageBox::question(
             this,
             "Confirm installation",
@@ -759,6 +961,9 @@ private:
 
         if (answer != QMessageBox::Yes)
             return;
+
+        QSettings settings("Atrim", "AtrimLinux");
+        settings.setValue("lastVersion", version);
 
         setBusy(true, "Downloading " + version + "…");
         progressBar->setRange(0, 0);
@@ -790,8 +995,6 @@ private:
             return;
         }
 
-        // Official asset sizes are pinned: a size mismatch means a truncated
-        // download or a re-uploaded asset the launcher does not know.
         if (rel.size > 0 && archiveSize != rel.size) {
             setBusy(false);
             QMessageBox::critical(this, "Download failed",
@@ -839,7 +1042,6 @@ private:
             return;
         }
 
-        // Validate payload before touching the game folder.
         bool payloadOk = false;
         {
             QDirIterator it(extracted, QDir::Files, QDirIterator::Subdirectories);
@@ -873,7 +1075,6 @@ private:
             return;
         }
 
-        // Back up any saves found in known locations.
         statusLabel->setText("Backing up saves and game files…");
         QApplication::processEvents();
 
@@ -887,7 +1088,6 @@ private:
             }
         }
 
-        // Back up exactly the files this archive would overwrite.
         QDir extractedDir(extracted);
         const QFileInfoList topLevel = extractedDir.entryInfoList(
             QDir::Files | QDir::Dirs | QDir::NoDotAndDotDot);
