@@ -37,6 +37,23 @@ jobs:
       - name: Build AppImage
         run: bash packaging/build-appimage.sh
 
+      - name: Smoke test AppImage
+        run: |
+          # Offscreen boot check: the app must stay alive in its event loop
+          # (timeout kills it -> exit 124). Anything else means it crashed.
+          export APPIMAGE_EXTRACT_AND_RUN=1
+          export QT_QPA_PLATFORM=offscreen
+          set +e
+          timeout 20 ./AtrimLinux-*-x86_64.AppImage
+          rc=$?
+          set -e
+          if [ "$rc" -eq 124 ]; then
+            echo "smoke test OK: AppImage booted and stayed running"
+          else
+            echo "smoke test FAILED: AppImage exited with code $rc"
+            exit 1
+          fi
+
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
