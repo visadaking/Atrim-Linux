@@ -2,11 +2,15 @@
 #include <QComboBox>
 #include <QDir>
 #include <QDirIterator>
+#include <QEventLoop>
 #include <QFileDialog>
 #include <QFileInfo>
 #include <QInputDialog>
 #include <QLabel>
 #include <QMessageBox>
+#include <QNetworkAccessManager>
+#include <QNetworkReply>
+#include <QNetworkRequest>
 #include <QOpenGLContext>
 #include <QOpenGLFunctions>
 #include <QOffscreenSurface>
@@ -20,6 +24,7 @@
 #include <QSurfaceFormat>
 #include <QSet>
 #include <QTemporaryDir>
+#include <QTimer>
 #include <QUrl>
 #include <QDesktopServices>
 #include <QDateTime>
@@ -28,6 +33,11 @@
 
 #include <algorithm>
 #include <functional>
+
+// Portable across init systems (systemd / OpenRC / runit / s6) and distros
+// (glibc / musl, GNU / BusyBox): no systemctl/logind/journald dependency,
+// no hard requirement on curl, no GNU-only cp flags. Downloads use QtNetwork,
+// file copies use Qt, extraction tries whatever backend the distro provides.
 
 class Launcher : public QWidget
 {
@@ -297,6 +307,8 @@ private:
         };
         roots << steamLibraries();
 
+        // Init-system independent: QStorageInfo reads /proc/self/mounts,
+        // works on systemd, OpenRC, runit and s6 alike.
         for (const QStorageInfo &volume : QStorageInfo::mountedVolumes()) {
             const QString mount = QDir::cleanPath(volume.rootPath());
             if (mount.startsWith("/mnt/")
@@ -367,7 +379,7 @@ private:
             };
 
         for (const QString &root : roots) {
-            // External mounts: keep depth shallow to avoid full-disk walks.
+            // external mounts: keep depth shallow to avoid full-disk walks.
             const bool isMount = root.startsWith("/mnt/")
                 || root.startsWith("/media/")
                 || root.startsWith("/run/media/");
@@ -433,6 +445,186 @@ private:
         return proc.exitStatus() == QProcess::NormalExit && proc.exitCode() == 0;
     }
 
+    // Qt-native download: no curl/wget dependency, so this works on minimal
+    // distros (Alpine/musl, Gentoo OpenRC, Void, NixOS) and inside AppImage.
+    bool downloadFile(const QUrl &url, const QString &destPath, QString *errOut)
+    {
+        QFile out(destPath);
+        if (!out.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+            if (errOut)
+                *errOut = "Cannot write to " + destPath + ": " + out.errorString();
+            return false;
+        }
+
+        QNetworkAccessManager manager;
+        QNetworkRequest request(url);
+        request.setHeader(QNetworkRequest::UserAgentHeader, "AtrimLinuxLauncher/0.2");
+#if QT_VERSION_MAJOR >= 6
+        request.setAttribute(QNetworkRequest::RedirectPolicyAttribute,
+                             QNetworkRequest::NoLessSafeRedirectPolicy);
+#else
+        request.setAttribute(QNetworkRequest::FollowRedirectsAttribute, true);
+#endif
+
+        QNetworkReply *reply = manager.get(request);
+        if (!reply) {
+            if (errOut)
+                *errOut = "Network request failed to start.";
+            return false;
+        }
+
+        QEventLoop loop;
+        QTimer timeout;
+        timeout.setSingleShot(true);
+        timeout.setInterval(120000);
+        connect(&timeout, &QTimer::timeout, &loop, [&] {
+            reply->abort();
+        });
+        connect(reply, &QNetworkReply::downloadProgress, this,
+                [&](qint64 received, qint64 total) {
+            if (total > 0) {
+                progressBar->setRange(0, 100);
+                progressBar->setValue(static_cast<int>(received * 100 / total));
+                statusLabel->setText(
+                    QString("Downloading… %1 / %2 MiB")
+                    .arg(received / 1048576).arg(total / 1048576));
+                QApplication::processEvents();
+            }
+        });
+        connect(reply, &QNetworkReply::readyRead, &loop, [&] {
+            out.write(reply->readAll());
+        });
+        connect(reply, &QNetworkReply::finished, &loop, &QEventLoop::quit);
+        timeout.start();
+        loop.exec();
+        timeout.stop();
+
+        const bool ok = (reply->error() == QNetworkReply::NoError);
+        QString netErr;
+        if (!ok)
+            netErr = reply->errorString();
+        // Flush anything left in the buffer.
+        out.write(reply->readAll());
+        out.close();
+        reply->deleteLater();
+
+        if (!ok) {
+            QFile::remove(destPath);
+            if (errOut)
+                *errOut = "Download failed: " + netErr;
+            return false;
+        }
+        return true;
+    }
+
+    // Qt-native file copy: avoids GNU-only "cp -a" (missing/different on
+    // BusyBox, BSD, minimal containers). Overwrites destination.
+    static bool copyFileOverwrite(const QString &src, const QString &dst, QString *errOut)
+    {
+        QFileInfo srcInfo(src);
+        if (srcInfo.isSymLink()) {
+            // Preserve symlinks where possible; fall back to content copy.
+            const QString target = srcInfo.symLinkTarget();
+            QFile::remove(dst);
+            if (QFile::link(target, dst))
+                return true;
+        }
+        QDir().mkpath(QFileInfo(dst).absolutePath());
+        QFile::remove(dst);
+        if (!QFile::copy(src, dst)) {
+            if (errOut)
+                *errOut = "Copy failed: " + src + " -> " + dst;
+            return false;
+        }
+        return true;
+    }
+
+    static bool copyRecursively(const QString &src, const QString &dst, QString *errOut)
+    {
+        QFileInfo info(src);
+        if (info.isFile() || info.isSymLink())
+            return copyFileOverwrite(src, dst, errOut);
+
+        QDir srcDir(src);
+        if (!srcDir.exists()) {
+            if (errOut)
+                *errOut = "Source does not exist: " + src;
+            return false;
+        }
+        if (!QDir().mkpath(dst)) {
+            if (errOut)
+                *errOut = "Cannot create directory: " + dst;
+            return false;
+        }
+        const QFileInfoList entries = srcDir.entryInfoList(
+            QDir::Files | QDir::Dirs | QDir::Hidden | QDir::System | QDir::NoDotAndDotDot);
+        for (const QFileInfo &e : entries) {
+            if (!copyRecursively(e.absoluteFilePath(), dst + "/" + e.fileName(), errOut))
+                return false;
+        }
+        return true;
+    }
+
+    // Extraction with distro fallbacks: unzip (BusyBox/GNU), 7z/7zz/7za,
+    // bsdtar (libarchive), python3 zipfile (near-universal fallback).
+    static bool extractArchive(const QString &archive, const QString &destDir, QString *errOut)
+    {
+        QStringList attempts;
+        QString lastErr;
+
+        auto tryRun = [&](const QString &prog, const QStringList &args) -> bool {
+            if (QStandardPaths::findExecutable(prog).isEmpty()) {
+                attempts << prog + " (not installed)";
+                return false;
+            }
+            QString err;
+            if (runBlocking(prog, args, &err)) {
+                // Sanity: extractor must have produced something.
+                QDir d(destDir);
+                if (!d.entryList(QDir::Files | QDir::Dirs | QDir::NoDotAndDotDot).isEmpty())
+                    return true;
+                lastErr = prog + " ran but produced no files.";
+                return false;
+            }
+            lastErr = prog + ": " + err;
+            attempts << (prog + ": " + err);
+            return false;
+        };
+
+        if (tryRun("unzip", {"-q", "-o", archive, "-d", destDir}))
+            return true;
+        for (const char *seven : {"7z", "7zz", "7za"}) {
+            if (tryRun(seven, {"x", archive, "-o" + destDir, "-y"}))
+                return true;
+        }
+        if (tryRun("bsdtar", {"-xf", archive, "-C", destDir}))
+            return true;
+        for (const char *py : {"python3", "python"}) {
+            if (tryRun(py, {"-m", "zipfile", "-e", archive, destDir}))
+                return true;
+        }
+
+        if (errOut) {
+            *errOut = "No usable unzip backend found.\nTried: " + attempts.join("; ")
+                + (lastErr.isEmpty() ? "" : "\nLast error: " + lastErr)
+                + "\nInstall one of: unzip, p7zip, bsdtar, or python3.\n"
+                  "(apt: sudo apt install unzip | dnf: sudo dnf install unzip p7zip | "
+                  "pacman: sudo pacman -S unzip p7zip | apk: sudo apk add unzip p7zip libarchive-tools python3 | "
+                  "emerge: sudo emerge -av unzip p7zip libarchive | xbps: sudo xbps-install -S unzip p7zip bsdtar python3 | "
+                  "zypper: sudo zypper install unzip p7zip)";
+        }
+        return false;
+    }
+
+    static QString backupBaseDir()
+    {
+        // Respects $XDG_DATA_HOME on all distros; falls back to ~/.local/share.
+        QString base = QStandardPaths::writableLocation(QStandardPaths::GenericDataLocation);
+        if (base.isEmpty())
+            base = QDir::homePath() + "/.local/share";
+        return base + "/atrim-backups";
+    }
+
     static QStringList findAmnesiaSaveDirs()
     {
         QStringList out;
@@ -490,18 +682,6 @@ private:
             return;
         }
 
-        for (const char *tool : {"curl", "unzip", "cp"}) {
-            if (QStandardPaths::findExecutable(tool).isEmpty()) {
-                QMessageBox::critical(
-                    this,
-                    "Missing dependency",
-                    QString("Required tool '%1' was not found in PATH.\n"
-                            "Install it with your package manager and retry.").arg(tool)
-                );
-                return;
-            }
-        }
-
         const QString url = versionBox->currentData().toString();
         const QString version = versionBox->currentText();
 
@@ -519,6 +699,7 @@ private:
             return;
 
         setBusy(true, "Downloading " + version + "…");
+        progressBar->setRange(0, 0);
 
         QTemporaryDir tempDir;
         if (!tempDir.isValid()) {
@@ -531,13 +712,11 @@ private:
         const QString extracted = tempDir.filePath("extracted");
 
         QString err;
-        if (!runBlocking("curl", {"--fail", "--location", "--retry", "3",
-                                  "--connect-timeout", "30",
-                                  "--silent", "--show-error",
-                                  "--output", archive, url}, &err)) {
+        if (!downloadFile(QUrl(url), archive, &err)) {
             setBusy(false);
+            progressBar->setRange(0, 0);
             QMessageBox::critical(this, "Download failed",
-                err.isEmpty() ? "curl failed with no error output." : err);
+                err.isEmpty() ? "Download failed with no error output." : err);
             return;
         }
 
@@ -550,13 +729,14 @@ private:
         }
 
         statusLabel->setText("Extracting archive…");
+        progressBar->setRange(0, 0);
         QApplication::processEvents();
         QDir().mkpath(extracted);
 
-        if (!runBlocking("unzip", {"-q", archive, "-d", extracted}, &err)) {
+        if (!extractArchive(archive, extracted, &err)) {
             setBusy(false);
             QMessageBox::critical(this, "Extraction failed",
-                err.isEmpty() ? "unzip failed with no error output." : err);
+                err.isEmpty() ? "Extraction failed with no error output." : err);
             return;
         }
 
@@ -584,8 +764,7 @@ private:
         }
 
         const QString backupRoot =
-            QDir::homePath()
-            + "/.local/share/atrim-backups/"
+            backupBaseDir() + "/"
             + QDateTime::currentDateTime().toString("yyyyMMdd-HHmmss");
 
         if (!QDir().mkpath(backupRoot)) {
@@ -602,7 +781,7 @@ private:
         int saveIndex = 0;
         for (const QString &saveSource : findAmnesiaSaveDirs()) {
             const QString dest = backupRoot + QString("/Amnesia-saves-%1").arg(++saveIndex);
-            if (!runBlocking("cp", {"-a", saveSource, dest}, &err)) {
+            if (!copyRecursively(saveSource, dest, &err)) {
                 setBusy(false);
                 QMessageBox::critical(this, "Save backup failed", err);
                 return;
@@ -617,7 +796,7 @@ private:
             const QString target = selectedFolder + "/" + entry.fileName();
             if (!QFileInfo::exists(target))
                 continue;
-            if (!runBlocking("cp", {"-a", target, backupRoot + "/" + entry.fileName()}, &err)) {
+            if (!copyRecursively(target, backupRoot + "/" + entry.fileName(), &err)) {
                 setBusy(false);
                 QMessageBox::critical(this, "Backup failed",
                     "Could not back up " + target + ":\n" + err);
@@ -628,10 +807,13 @@ private:
         statusLabel->setText("Installing files…");
         QApplication::processEvents();
 
-        if (!runBlocking("cp", {"-a", extracted + "/.", selectedFolder + "/"}, &err)) {
-            setBusy(false);
-            QMessageBox::critical(this, "Installation failed", err);
-            return;
+        for (const QFileInfo &entry : topLevel) {
+            if (!copyRecursively(entry.absoluteFilePath(),
+                                 selectedFolder + "/" + entry.fileName(), &err)) {
+                setBusy(false);
+                QMessageBox::critical(this, "Installation failed", err);
+                return;
+            }
         }
 
         setBusy(false);
