@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(AtrimLauncher VERSION 0.1 LANGUAGES CXX)
+project(AtrimLauncher VERSION 0.2.1 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -26,3 +26,11 @@ target_link_libraries(atrim-launcher PRIVATE
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
   target_compile_options(atrim-launcher PRIVATE -Wall -Wextra)
 endif()
+
+# Install layout (also used for the AppDir).
+include(GNUInstallDirs)
+install(TARGETS atrim-launcher RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+install(FILES packaging/atrim-launcher.desktop
+  DESTINATION ${CMAKE_INSTALL_DATADIR}/applications)
+install(FILES packaging/atrim-launcher.png
+  DESTINATION ${CMAKE_INSTALL_DATADIR}/icons/hicolor/256x256/apps)

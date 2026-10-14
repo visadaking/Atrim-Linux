@@ -1,0 +1,50 @@
+name: AppImage
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+jobs:
+  appimage:
+    # Old baseline on purpose: glibc 2.35, so the AppImage starts on
+    # Ubuntu 22.04+ and most newer distros (universal x86_64 build).
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Qt6 + build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake g++ make \
+            qt6-base-dev qt6-base-dev-tools \
+            libgl1-mesa-dev libvulkan-dev \
+            file wget
+
+      - name: Fetch linuxdeploy toolchain
+        run: |
+          mkdir -p /tmp/opencode/tools
+          cd /tmp/opencode/tools
+          wget -q -O linuxdeploy \
+            https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-x86_64.AppImage
+          wget -q -O linuxdeploy-plugin-qt \
+            https://github.com/linuxdeploy/linuxdeploy-plugin-qt/releases/download/continuous/linuxdeploy-plugin-qt-x86_64.AppImage
+          wget -q -O appimagetool \
+            https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage
+          chmod +x linuxdeploy linuxdeploy-plugin-qt appimagetool
+
+      - name: Build AppImage
+        run: bash packaging/build-appimage.sh
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: AtrimLinux-x86_64
+          path: "*.AppImage"
+
+      - name: Attach to release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: "*.AppImage"

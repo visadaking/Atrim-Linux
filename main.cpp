@@ -1,5 +1,6 @@
 #include <QApplication>
 #include <QComboBox>
+#include <QCryptographicHash>
 #include <QDir>
 #include <QDirIterator>
 #include <QEventLoop>
@@ -72,21 +73,11 @@ public:
         browseButton = new QPushButton("Choose game folder…");
 
         versionBox = new QComboBox;
-        versionBox->addItem(
-            "Stable — v1.4.5-win32",
-            "https://github.com/roozerxc/atrim/releases/download/"
-            "v1.4.5-win32/v1.4.5-win32-release.zip"
-        );
-        versionBox->addItem(
-            "Beta — v1.4.6-win32",
-            "https://github.com/roozerxc/atrim/releases/download/"
-            "v1.4.6-win32-beta/v1.4.6-win32-beta.zip"
-        );
-        versionBox->addItem(
-            "Beta — v1.4.6-win64",
-            "https://github.com/roozerxc/atrim/releases/download/"
-            "v1.4.6-win32-beta/v1.4.6-win64-beta.zip"
-        );
+        // Official install flow (roozerxc/atrim Releases): download the zip,
+        // drag ALL of its contents into the Amnesia folder, overwrite.
+        // Sizes + SHA-256 verified against the GitHub release API.
+        for (const ReleaseInfo &rel : releases())
+            versionBox->addItem(rel.label, releaseToData(rel));
 
         installButton = new QPushButton("Install selected Atrim version");
         installButton->setEnabled(false);
@@ -662,6 +653,70 @@ private:
         return out;
     }
 
+    struct ReleaseInfo {
+        QString label;
+        QString url;
+        qint64 size = 0;
+        QString sha256;
+    };
+
+    // Mirrors the official roozerxc/atrim Releases page: latest stable plus
+    // the newest beta archives. Sizes/SHA-256 taken from the GitHub API.
+    static const QList<ReleaseInfo> &releases()
+    {
+        static const QList<ReleaseInfo> list = {
+            {"Stable — v1.4.5-win32-release",
+             "https://github.com/roozerxc/atrim/releases/download/"
+             "v1.4.5-win32/v1.4.5-win32-release.zip",
+             9082247,
+             "377bb069185033ee5ae4a36017154a53532c688a19d13b4a9950dd7204fe7c91"},
+            {"Beta — v1.4.6-win32-beta",
+             "https://github.com/roozerxc/atrim/releases/download/"
+             "v1.4.6-win32-beta/v1.4.6-win32-beta.zip",
+             9311694,
+             "f09142777bfb969f65b9f0fccd497199192bc52b206a5e18eb7339fce5d1d289"},
+            {"Beta — v1.4.6-win64-beta",
+             "https://github.com/roozerxc/atrim/releases/download/"
+             "v1.4.6-win32-beta/v1.4.6-win64-beta.zip",
+             10001867,
+             "6367efd32dd3fdb233bc62bb6e2e390da176c42aa532913a9760e34ea3440e34"},
+        };
+        return list;
+    }
+
+    static QStringList releaseToData(const ReleaseInfo &rel)
+    {
+        return {rel.url, QString::number(rel.size), rel.sha256};
+    }
+
+    ReleaseInfo currentRelease() const
+    {
+        ReleaseInfo rel;
+        rel.label = versionBox->currentText();
+        const QStringList data = versionBox->currentData().toStringList();
+        if (data.size() > 0)
+            rel.url = data.at(0);
+        if (data.size() > 1)
+            rel.size = data.at(1).toLongLong();
+        if (data.size() > 2)
+            rel.sha256 = data.at(2);
+        return rel;
+    }
+
+    static QString sha256OfFile(const QString &path, QString *errOut)
+    {
+        QFile f(path);
+        if (!f.open(QIODevice::ReadOnly)) {
+            if (errOut)
+                *errOut = "Cannot read " + path + ": " + f.errorString();
+            return {};
+        }
+        QCryptographicHash hash(QCryptographicHash::Sha256);
+        while (!f.atEnd())
+            hash.addData(f.read(1 << 20));
+        return QString::fromLatin1(hash.result().toHex());
+    }
+
     void installSelected()
     {
         if (selectedFolder.isEmpty()) {
@@ -682,8 +737,15 @@ private:
             return;
         }
 
-        const QString url = versionBox->currentData().toString();
-        const QString version = versionBox->currentText();
+        const ReleaseInfo rel = currentRelease();
+        const QString url = rel.url;
+        const QString version = rel.label;
+
+        if (url.isEmpty()) {
+            QMessageBox::critical(this, "No download URL",
+                "No download URL is configured for this version.");
+            return;
+        }
 
         const auto answer = QMessageBox::question(
             this,
@@ -726,6 +788,43 @@ private:
             QMessageBox::critical(this, "Download failed",
                 QString("Downloaded file is suspiciously small (%1 bytes). Aborting.").arg(archiveSize));
             return;
+        }
+
+        // Official asset sizes are pinned: a size mismatch means a truncated
+        // download or a re-uploaded asset the launcher does not know.
+        if (rel.size > 0 && archiveSize != rel.size) {
+            setBusy(false);
+            QMessageBox::critical(this, "Download failed",
+                QString("Size mismatch: got %1 bytes, expected %2 bytes.\n"
+                        "The release asset may have changed. Aborting.")
+                    .arg(archiveSize).arg(rel.size));
+            return;
+        }
+
+        if (!rel.sha256.isEmpty()) {
+            statusLabel->setText("Verifying download…");
+            QApplication::processEvents();
+            const QString actual = sha256OfFile(archive, &err);
+            if (actual.isEmpty()) {
+                setBusy(false);
+                QMessageBox::critical(this, "Verification failed", err);
+                return;
+            }
+            if (actual.compare(rel.sha256, Qt::CaseInsensitive) != 0) {
+                setBusy(false);
+                const auto cont = QMessageBox::warning(
+                    this,
+                    "Checksum mismatch",
+                    "SHA-256 does not match the official release asset.\n\n"
+                    "Expected:\n" + rel.sha256 + "\n\nGot:\n" + actual +
+                    "\n\nContinue anyway?",
+                    QMessageBox::Yes | QMessageBox::No,
+                    QMessageBox::No
+                );
+                if (cont != QMessageBox::Yes)
+                    return;
+                setBusy(true, "Installing " + version + "…");
+            }
         }
 
         statusLabel->setText("Extracting archive…");

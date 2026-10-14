@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Atrim Linux
+Comment=Install Atrim into an existing Amnesia: The Dark Descent folder
+Exec=atrim-launcher
+Icon=atrim-launcher
+Categories=Game;
+Terminal=false
+StartupWMClass=atrim-launcher
