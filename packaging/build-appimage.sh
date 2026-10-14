@@ -42,8 +42,44 @@ export APPIMAGE_EXTRACT_AND_RUN=1
 export QMAKE="$(command -v qmake6 || command -v qmake || true)"
 "$TOOLS_DIR/linuxdeploy" \
   --appdir "$APPDIR" \
-  --plugin qt \
-  --output appimage
+  --plugin qt
+
+# linuxdeploy-plugin-qt sometimes ships only the platform plugin in use
+# (e.g. xcb). A missing offscreen/minimal/wayland plugin aborts the app
+# with SIGABRT on systems without X11, so backfill every platform plugin
+# (and Wayland integration plugins) from the Qt install, then let
+# linuxdeploy pull in their extra dependencies.
+QT_PLUGINS="$("$QMAKE" -query QT_INSTALL_PLUGINS 2>/dev/null || true)"
+if [ -n "$QT_PLUGINS" ] && [ -d "$QT_PLUGINS/platforms" ]; then
+  echo "==> Backfilling all Qt platform plugins from $QT_PLUGINS"
+  mkdir -p "$APPDIR/usr/plugins/platforms"
+  cp -n "$QT_PLUGINS"/platforms/*.so "$APPDIR/usr/plugins/platforms/" 2>/dev/null || true
+  for plugdir in wayland-shell-integration wayland-graphics-integration-client \
+                  wayland-decoration-client xcbglintegrations egldeviceintegrations; do
+    if [ -d "$QT_PLUGINS/$plugdir" ]; then
+      mkdir -p "$APPDIR/usr/plugins/$plugdir"
+      cp -n "$QT_PLUGINS/$plugdir"/*.so "$APPDIR/usr/plugins/$plugdir/" 2>/dev/null || true
+    fi
+  done
+  echo "==> Re-running linuxdeploy for backfilled plugin deps"
+  "$TOOLS_DIR/linuxdeploy" \
+    --appdir "$APPDIR" \
+    --plugin qt
+else
+  echo "WARNING: could not locate Qt plugins dir; AppImage may miss platform plugins"
+fi
+
+echo "==> Building AppImage (appimagetool)"
+RUNTIME_FILE="${RUNTIME_FILE:-$TOOLS_DIR/runtime-x86_64}"
+if [ ! -f "$RUNTIME_FILE" ]; then
+  curl -sL --retry 2 -o "$RUNTIME_FILE" \
+    "https://github.com/AppImage/type2-runtime/releases/download/continuous/runtime-x86_64"
+fi
+OUT="AtrimLinux-${VERSION}-x86_64.AppImage"
+rm -f "$OUT"
+"$TOOLS_DIR/appimagetool" \
+  --runtime-file "$RUNTIME_FILE" \
+  "$APPDIR" "$OUT"
 
 echo "==> Done:"
-ls -l ./*.AppImage "$APPDIR"/../*.AppImage 2>/dev/null || ls -l ./*.AppImage
+ls -l "$OUT"
