@@ -28,6 +28,10 @@ echo "==> Building"
 cmake --build "$BUILD_DIR" -j"$(nproc)"
 
 echo "==> Installing into AppDir"
+if [ -z "$APPDIR" ] || [ "$APPDIR" = "/" ]; then
+  echo "Refusing to rm -rf on APPDIR='$APPDIR' — set APPDIR to a build directory." >&2
+  exit 1
+fi
 rm -rf "$APPDIR"
 DESTDIR="$APPDIR" cmake --install "$BUILD_DIR" --prefix /usr
 mkdir -p "$APPDIR/usr/share/icons/hicolor/256x256/apps"
